@@ -32,6 +32,7 @@ pub struct SystemSpecs {
     pub cpu_name: String,
     pub has_gpu: bool,
     pub gpu_vram_gb: Option<f64>,
+    pub gpu_vram_free_gb: Option<f64>,
     pub gpu_name: Option<String>,
     pub gpu_count: u32,
     pub unified_memory: bool,
@@ -60,7 +61,7 @@ impl SystemSpecs {
             .map(|cpu| cpu.brand().to_string())
             .unwrap_or_else(|| "Unknown CPU".to_string());
 
-        let (has_gpu, gpu_vram_gb, gpu_name, gpu_count, unified_memory, backend) =
+        let (has_gpu, gpu_vram_gb, gpu_vram_free_gb, gpu_name, gpu_count, unified_memory, backend) =
             Self::detect_gpu(available_ram_gb, &cpu_name);
 
         SystemSpecs {
@@ -70,6 +71,7 @@ impl SystemSpecs {
             cpu_name,
             has_gpu,
             gpu_vram_gb,
+            gpu_vram_free_gb,
             gpu_name,
             gpu_count,
             unified_memory,
@@ -78,7 +80,7 @@ impl SystemSpecs {
     }
 
     #[allow(clippy::type_complexity)]
-    fn detect_gpu(available_ram_gb: f64, cpu_name: &str) -> (bool, Option<f64>, Option<String>, u32, bool, GpuBackend) {
+    fn detect_gpu(available_ram_gb: f64, cpu_name: &str) -> (bool, Option<f64>, Option<f64>, Option<String>, u32, bool, GpuBackend) {
         let cpu_backend = if cfg!(target_arch = "aarch64") || cpu_name.to_lowercase().contains("apple") {
             GpuBackend::CpuArm
         } else {
@@ -121,7 +123,11 @@ impl SystemSpecs {
                             }
                         }
                         let vram = if vram_gb > 0.0 { Some(vram_gb) } else { None };
-                        return (true, vram, first_name, count, false, GpuBackend::Cuda);
+
+                        // Query free VRAM
+                        let free_vram = Self::query_nvidia_free_vram();
+
+                        return (true, vram, free_vram, first_name, count, false, GpuBackend::Cuda);
                     }
                 }
             }
@@ -134,13 +140,13 @@ impl SystemSpecs {
             .output()
         {
             if output.status.success() {
-                return (true, None, None, 1, false, GpuBackend::Rocm);
+                return (true, None, None, None, 1, false, GpuBackend::Rocm);
             }
         }
 
         // Check for Intel Arc GPU via sysfs (integrated or discrete)
         if let Some(vram) = Self::detect_intel_gpu() {
-            return (true, Some(vram), Some("Intel Arc".to_string()), 1, false, GpuBackend::Sycl);
+            return (true, Some(vram), None, Some("Intel Arc".to_string()), 1, false, GpuBackend::Sycl);
         }
 
         // Check for Apple Silicon (unified memory architecture)
@@ -150,14 +156,37 @@ impl SystemSpecs {
             } else {
                 Some("Apple Silicon".to_string())
             };
-            return (true, Some(vram), name, 1, true, GpuBackend::Metal);
+            return (true, Some(vram), None, name, 1, true, GpuBackend::Metal);
         }
 
-        (false, None, None, 0, false, cpu_backend)
+        (false, None, None, None, 0, false, cpu_backend)
     }
 
-    /// Estimate VRAM from a GPU model name when detection reports 0.
-    /// Covers NVIDIA RTX 50/40/30 series and AMD RX 7000/6000 series.
+    /// Query free VRAM from nvidia-smi.
+    fn query_nvidia_free_vram() -> Option<f64> {
+        let output = std::process::Command::new("nvidia-smi")
+            .arg("--query-gpu=memory.free")
+            .arg("--format=csv,noheader,nounits")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let mut total_free_mb: f64 = 0.0;
+        let mut found = false;
+        for line in text.lines() {
+            if let Ok(mb) = line.trim().parse::<f64>() {
+                total_free_mb += mb;
+                found = true;
+            }
+        }
+        if found && total_free_mb > 0.0 {
+            Some(total_free_mb / 1024.0)
+        } else {
+            None
+        }
+    }
 
     /// Detect Intel Arc / Intel integrated GPU via sysfs or lspci.
     /// Intel Arc GPUs (A370M, A770, etc.) have dedicated VRAM exposed via
@@ -325,6 +354,10 @@ impl SystemSpecs {
     }
 
     pub fn display(&self) {
+        self.display_with_options(false);
+    }
+
+    pub fn display_with_options(&self, use_available_vram: bool) {
         println!("\n=== System Specifications ===");
         println!("CPU: {} ({} cores)", self.cpu_name, self.total_cpu_cores);
         println!("Total RAM: {:.2} GB", self.total_ram_gb);
@@ -340,12 +373,17 @@ impl SystemSpecs {
                     self.gpu_vram_gb.unwrap_or(0.0)
                 );
             } else {
-                match self.gpu_vram_gb {
+                let (vram_val, suffix) = if use_available_vram {
+                    (self.gpu_vram_free_gb.or(self.gpu_vram_gb), " (available)")
+                } else {
+                    (self.gpu_vram_gb, "")
+                };
+                match vram_val {
                     Some(vram) if vram > 0.0 => {
                         if self.gpu_count > 1 {
-                            println!("GPU: {} x{} ({:.2} GB VRAM total)", gpu_label, self.gpu_count, vram);
+                            println!("GPU: {} x{} ({:.2} GB VRAM{})", gpu_label, self.gpu_count, vram, suffix);
                         } else {
-                            println!("GPU: {} ({:.2} GB VRAM)", gpu_label, vram);
+                            println!("GPU: {} ({:.2} GB VRAM{})", gpu_label, vram, suffix);
                         }
                     }
                     Some(_) => println!("GPU: {} (shared system memory)", gpu_label),

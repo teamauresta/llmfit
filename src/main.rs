@@ -34,6 +34,14 @@ struct Cli {
     /// Output results as JSON (for tool integration)
     #[arg(long)]
     json: bool,
+
+    /// Use actual free VRAM instead of total VRAM for fit analysis
+    #[arg(long)]
+    available: bool,
+
+    /// Skip loading cached model database (use embedded DB only)
+    #[arg(long)]
+    offline: bool,
 }
 
 #[derive(Subcommand)]
@@ -67,6 +75,9 @@ enum Commands {
         model: String,
     },
 
+    /// Update model database from HuggingFace
+    Update,
+
     /// Recommend top models for your hardware (JSON-friendly)
     Recommend {
         /// Limit number of recommendations
@@ -87,12 +98,19 @@ enum Commands {
     },
 }
 
-fn run_fit(perfect: bool, limit: Option<usize>, json: bool) {
-    let specs = SystemSpecs::detect();
-    let db = ModelDatabase::new();
+fn run_fit(perfect: bool, limit: Option<usize>, json: bool, available: bool, offline: bool) {
+    let mut specs = SystemSpecs::detect();
+    let db = ModelDatabase::load(offline);
+
+    // When --available is set, override gpu_vram_gb with free VRAM
+    if available {
+        if let Some(free) = specs.gpu_vram_free_gb {
+            specs.gpu_vram_gb = Some(free);
+        }
+    }
 
     if !json {
-        specs.display();
+        specs.display_with_options(available);
     }
 
     let mut fits: Vec<ModelFit> = db
@@ -159,9 +177,15 @@ fn run_tui() -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_recommend(limit: usize, use_case: Option<String>, min_fit: String, json: bool) {
-    let specs = SystemSpecs::detect();
-    let db = ModelDatabase::new();
+fn run_recommend(limit: usize, use_case: Option<String>, min_fit: String, json: bool, available: bool, offline: bool) {
+    let mut specs = SystemSpecs::detect();
+    let db = ModelDatabase::load(offline);
+
+    if available {
+        if let Some(free) = specs.gpu_vram_free_gb {
+            specs.gpu_vram_gb = Some(free);
+        }
+    }
 
     let mut fits: Vec<ModelFit> = db
         .get_all_models()
@@ -224,28 +248,37 @@ fn main() {
                 if cli.json {
                     display::display_json_system(&specs);
                 } else {
-                    specs.display();
+                    specs.display_with_options(cli.available);
                 }
             }
 
             Commands::List => {
-                let db = ModelDatabase::new();
+                let db = ModelDatabase::load(cli.offline);
                 display::display_all_models(db.get_all_models());
             }
 
             Commands::Fit { perfect, limit } => {
-                run_fit(perfect, limit, cli.json);
+                run_fit(perfect, limit, cli.json, cli.available, cli.offline);
             }
 
             Commands::Search { query } => {
-                let db = ModelDatabase::new();
+                let db = ModelDatabase::load(cli.offline);
                 let results = db.find_model(&query);
                 display::display_search_results(&results, &query);
             }
 
+            Commands::Update => {
+                models::update_from_huggingface();
+            }
+
             Commands::Info { model } => {
-                let db = ModelDatabase::new();
-                let specs = SystemSpecs::detect();
+                let db = ModelDatabase::load(cli.offline);
+                let mut specs = SystemSpecs::detect();
+                if cli.available {
+                    if let Some(free) = specs.gpu_vram_free_gb {
+                        specs.gpu_vram_gb = Some(free);
+                    }
+                }
                 let results = db.find_model(&model);
 
                 if results.is_empty() {
@@ -270,7 +303,7 @@ fn main() {
             }
 
             Commands::Recommend { limit, use_case, min_fit, json } => {
-                run_recommend(limit, use_case, min_fit, json);
+                run_recommend(limit, use_case, min_fit, json, cli.available, cli.offline);
             }
         }
         return;
@@ -278,7 +311,7 @@ fn main() {
 
     // If --cli flag, use classic fit output
     if cli.cli {
-        run_fit(cli.perfect, cli.limit, cli.json);
+        run_fit(cli.perfect, cli.limit, cli.json, cli.available, cli.offline);
         return;
     }
 
